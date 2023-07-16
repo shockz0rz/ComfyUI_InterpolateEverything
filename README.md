@@ -12,7 +12,7 @@ Future features:
 
 To install:
 
-**First, install https://github.com/Fannovel16/comfy_controlnet_preprocessors ** if you haven't already:
+**First, install https://github.com/Fannovel16/comfy_controlnet_preprocessors** if you haven't already:
 ```sh
 cd <ComfyUI installation directory>/custom_nodes
 git clone https://github.com/Fannovel16/comfy_controlnet_preprocessors

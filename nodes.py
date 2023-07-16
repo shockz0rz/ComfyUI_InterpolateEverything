@@ -1,7 +1,7 @@
-import numpy as np
 import cv2
-from .util import common_annotator_call, img_np_to_tensor, img_tensor_to_np, HWC3, resize_image 
-from .v11 import openpose_v11
+from comfy_controlnet_preprocessors.nodes.util import img_np_to_tensor, img_tensor_to_np
+from comfy_controlnet_preprocessors.util import HWC3, resize_image
+from comfy_controlnet_preprocessors.v11 import openpose_v11
 
 def interpolate_body_poses( start_poses, end_poses, interp_factor ): 
     point_count = len (start_poses['subset'][0]) - 2 # probably 18

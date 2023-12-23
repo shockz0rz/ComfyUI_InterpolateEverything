@@ -1,7 +1,11 @@
 import cv2
+import numpy as np
+import simpleicp
 from comfy_controlnet_preprocessors.nodes.util import img_np_to_tensor, img_tensor_to_np
 from comfy_controlnet_preprocessors.util import HWC3, resize_image
 from comfy_controlnet_preprocessors.v11 import openpose_v11
+from typing import List
+from .icp_utils import icp_2d
 
 def interpolate_body_poses( start_poses, end_poses, interp_factor ): 
     point_count = len (start_poses['subset'][0]) - 2 # probably 18
@@ -49,6 +53,32 @@ def interpolate_body_poses( start_poses, end_poses, interp_factor ):
         out_subset[pose_i][-2] = (start_subset[-2] * (1.0 - interp_factor)) + (end_subset[-2] * interp_factor)
     
     return {'candidate': out_candidate, 'subset': out_subset}
+
+def get_face_transform(start_face: List[List[float]], end_face:List[List[float]]) -> List[float]:
+    start_np = np.array(start_face)
+    end_np = np.array(end_face)
+
+    icp_2d(start_np, end_np)
+
+
+
+
+
+def interpolate_face_poses( start_faces, end_faces, interp_factor ):
+    # Faces don't have any identifying indexes, they're just lists of points.
+    # They're not even guaranteed to have the same number of points. This kind of sucks for what we're trying to do here.
+    # We'll get the estimated transform necessary to convert each start-end pair, which in addition to getting us our necessary interpolation can also tell us
+    # which face corresponds to which.
+    transform_factors = []
+    for start_i in range(len(start_faces)):
+        transform_factors.append([])
+        for end_i in range(len(end_faces)):
+            if len(start_faces[start_i]) < 10 or len(end_faces[end_i]) < 10: # not enough points to estimate transform
+                transform_factors[start_i].append([-1.0, -1.0, -1.0])
+            transform_factors[start_i].append(get_face_transform(start_faces[start_i], end_faces[end_i])) #translation, rotation, scale, all on [0.0, 1.0] range
+    
+    return
+
 
 class OpenPose_Preprocessor_Interpolate:
     @classmethod

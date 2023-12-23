@@ -1,67 +1,78 @@
-import cv2
+import math
+import torch
 import numpy as np
-import simpleicp
-from comfy_controlnet_preprocessors.nodes.util import img_np_to_tensor, img_tensor_to_np
-from comfy_controlnet_preprocessors.util import HWC3, resize_image
-from comfy_controlnet_preprocessors.v11 import openpose_v11
-from typing import List
+import comfy.model_management as model_management
+from comfyui_controlnet_aux.utils import common_annotator_call, annotator_ckpts_path, HF_MODEL_NAME
+from comfyui_controlnet_aux.src.controlnet_aux.util import HWC3, resize_image_with_pad
+from comfyui_controlnet_aux.src.controlnet_aux import open_pose
+from typing import List, Tuple
 from .icp_utils import icp_2d
 
-def interpolate_body_poses( start_poses, end_poses, interp_factor ): 
-    point_count = len (start_poses['subset'][0]) - 2 # probably 18
+# Guess which pose in start_poses corresponds to which pose in end_poses by comparing distances between means 
+# TODO: Consider face and hand data when matching
+def match_poses( start_poses: List[open_pose.PoseResult], end_poses: List[open_pose.PoseResult] ) -> List[Tuple[int, int]]:
+    pose_count : int = min(len(start_poses), len(end_poses))
+    pose_matches_final : List[Tuple[int, int]] = []
+    pose_match_candidates : List[Tuple[float, int, int]] = []
+    for start_pose in start_poses:
+        for end_pose in end_poses:
+            start_mean_x = np.mean([keypoint.x for keypoint in start_pose.body.keypoints if keypoint is not None])
+            start_mean_y = np.mean([keypoint.y for keypoint in start_pose.body.keypoints if keypoint is not None])
+            end_mean_x = np.mean([keypoint.x for keypoint in end_pose.body.keypoints if keypoint is not None])
+            end_mean_y = np.mean([keypoint.y for keypoint in end_pose.body.keypoints if keypoint is not None])
+            distance = math.sqrt((start_mean_x - end_mean_x)**2 + (start_mean_y - end_mean_y)**2)
+            pose_match_candidates.append((distance, start_poses.index(start_pose), end_poses.index(end_pose)))
 
-    # this rules out trippy merges of bodies for now, sadly
-    pose_count = min(len(start_poses['subset']), len(end_poses['subset']))
+    # Sort by distance, then add to pose_matches_final if neither pose is already matched
+    pose_match_candidates.sort(key=lambda x: x[0])
+    for i in range(min(pose_count, len(pose_match_candidates))):
+        if pose_match_candidates[i][1] not in [x[0] for x in pose_matches_final] and pose_match_candidates[i][2] not in [x[1] for x in pose_matches_final]:
+            pose_matches_final.append((pose_match_candidates[i][1], pose_match_candidates[i][2]))
+    return pose_matches_final
 
-    # Each row of subset is a pose, and the first 18 columns are the indices of the points for that pose in candidate
-    # (the last two columns are the score and the number of detected points)
-    # The index in subset is the ID of the point, so out_candidate[out_subset[0][5]] is the coordinate for the left shoulder of the first pose
-    # Initialize output subset to no points found, score 0
-    empty_subset = [-1.0 for i in range(point_count)] + [0.0, 0.0]
-    out_subset = [empty_subset for i in range(pose_count)]
-
-    # Initialize output candidate to empty
-    out_candidate = []
-
-    start_candidate = start_poses['candidate']
-    end_candidate = end_poses['candidate']
-
-    for pose_i in range(pose_count):
-        start_subset = start_poses['subset'][pose_i]
-        end_subset = end_poses['subset'][pose_i]
-        for point_i in range(point_count):
-            if start_subset[point_i] == -1.0 and end_subset[point_i] == -1.0:
-                # point missing from both poses, out_subset already initialized to represent this, just keep going
-                continue 
-            # if here, we have at least one point found, increment point count in out_subset
-            out_subset[pose_i][-1] += 1.0
-            out_subset[pose_i][point_i] = float(len(out_candidate))
-            if start_subset[point_i] == -1.0: #point missing from start pose, use end pose
-                #possible enhancement: infer likely location of missing point from known points?
-                out_candidate.append(end_candidate[int(end_subset[point_i])])
-                continue
-            if end_subset[point_i] == -1.0: #point missing from end pose, use start pose
-                out_candidate.append(start_candidate[int(start_subset[point_i])])
-                continue
-                
-            # otherwise, we have both start and end points, interpolate
-            # x and y are a weighted average as you'd expect
-            outX = (start_candidate[int(start_subset[point_i])][0] * (1.0 - interp_factor)) + (end_candidate[int(end_subset[point_i])][0] * interp_factor)
-            outY = (start_candidate[int(start_subset[point_i])][1] * (1.0 - interp_factor)) + (end_candidate[int(end_subset[point_i])][1] * interp_factor)
-            out_candidate.append([outX, outY])
-        # set score to weighted average of start and end scores
-        out_subset[pose_i][-2] = (start_subset[-2] * (1.0 - interp_factor)) + (end_subset[-2] * interp_factor)
+def interpolate_poses( start_poses: List[open_pose.PoseResult], end_poses: List[open_pose.PoseResult], interp_factor: float, omit_missing_points: bool ) -> List[open_pose.PoseResult]:
+    matches = match_poses(start_poses, end_poses)
+    interpolated_poses = []
+    for pose_match in matches:
+        body_result = interpolate_body_pose(start_poses[pose_match[0]].body, end_poses[pose_match[1]].body, interp_factor, omit_missing_points)
+        interp_pose = open_pose.PoseResult(body = body_result, left_hand = None, right_hand = None, face = None)
+        interpolated_poses.append(interp_pose)
     
-    return {'candidate': out_candidate, 'subset': out_subset}
+    return interpolated_poses
+
+def interpolate_body_pose( start_pose: open_pose.BodyResult, end_pose: open_pose.BodyResult, interp_factor: float, omit_missing_points: bool ) -> open_pose.BodyResult: 
+    body_keypoints = []
+    score_sum = 0.0
+    for start_keyp, end_keyp in zip(start_pose.keypoints, end_pose.keypoints):
+        if start_keyp is None and end_keyp is None:
+            body_keypoints.append(None)
+        elif start_keyp is None and end_keyp is not None:
+            if omit_missing_points:
+                body_keypoints.append(None)
+            else:
+                body_keypoints.append(end_keyp)
+        elif start_keyp is not None and end_keyp is None:
+            if omit_missing_points:
+                body_keypoints.append(None)
+            else:
+                body_keypoints.append(start_keyp)
+        else:
+            keyp_id = start_keyp.id
+            keyp_x = (start_keyp.x * (1.0 - interp_factor)) + (end_keyp.x * interp_factor)
+            keyp_y = (start_keyp.y * (1.0 - interp_factor)) + (end_keyp.y * interp_factor)
+            keyp_score = 0.5 * (start_keyp.score + end_keyp.score)
+            score_sum += keyp_score
+            interp_keyp = open_pose.Keypoint(x = keyp_x, y = keyp_y, score = keyp_score, id = keyp_id)
+            body_keypoints.append(interp_keyp)
+    
+    return open_pose.BodyResult(keypoints = body_keypoints, total_score = score_sum, total_parts=len(body_keypoints))
+
 
 def get_face_transform(start_face: List[List[float]], end_face:List[List[float]]) -> List[float]:
     start_np = np.array(start_face)
     end_np = np.array(end_face)
 
     icp_2d(start_np, end_np)
-
-
-
 
 
 def interpolate_face_poses( start_faces, end_faces, interp_factor ):
@@ -85,30 +96,45 @@ class OpenPose_Preprocessor_Interpolate:
     def INPUT_TYPES(s):
         ret = {"required": { "start_image": ("IMAGE", ), 
                              "end_image": ("IMAGE", ), 
-                             "interp_factor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}) }}
+                             "interp_factor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                             "omit_any_missing_points": ("BOOLEAN", {"default": False }), }}
         return ret
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "preprocess_interpolated_pose"
-    CATEGORY = "preprocessors/pose"
+    CATEGORY = "ControlNet Preprocessors/Interpolation"
 
     # TODO: Implement hand and face interpolation
-    def preprocess_interpolated_pose(self, start_image, end_image, interp_factor):
-        start_tensor_image = resize_image(HWC3(img_tensor_to_np(start_image)[0]), resolution=512)
-        end_tensor_image = resize_image(HWC3(img_tensor_to_np(end_image)[0]), resolution=512)
-        start_result = openpose_v11.OpenposeDetector()(start_tensor_image, hand=False, body=True, face=False, return_is_index=True)
-        end_result = openpose_v11.OpenposeDetector()(end_tensor_image, hand=False, body=True, face=False, return_is_index=True)
+    def preprocess_interpolated_pose(self, start_image, end_image, interp_factor, omit_any_missing_points):
+        model = open_pose.OpenposeDetector.from_pretrained(HF_MODEL_NAME, cache_dir=annotator_ckpts_path).to(model_management.get_torch_device())
 
-        body_start = start_result['bodies']
-        body_end = end_result['bodies']
-        out_poses = {'bodies': interpolate_body_poses(body_start, body_end, interp_factor), 'faces': None, 'hands': None}
-        out_width = max(start_tensor_image.shape[1], end_tensor_image.shape[1])
-        out_height = max(start_tensor_image.shape[0], end_tensor_image.shape[0])
+        # TODO: handle batched inputs
+        np_start_image = np.asarray(start_image[0] * 255., dtype=np.uint8)
 
-        result = openpose_v11.draw_pose(out_poses, out_height, out_width, draw_body=True, draw_face=False, draw_hand=False)
+        # We don't actually want the output of the model() call - that gives us a final image.
+        # We want the output of the detect_poses() call, which gives us a list of PoseResult objects.
+        np_start_resized, start_remove_pad = resize_image_with_pad(np_start_image, 512, "INTER_CUBIC")
+        start_poses = model.detect_poses(np_start_resized, include_hand=False, include_face=False)
 
-        return (img_np_to_tensor([cv2.resize(HWC3(result), (out_width, out_height), interpolation=cv2.INTER_AREA)]),)
+        np_end_image = np.asarray(end_image[0] * 255., dtype=np.uint8)
+        np_end_resized, end_remove_pad = resize_image_with_pad(np_end_image, 512, "INTER_CUBIC")
+        end_poses = model.detect_poses(np_end_resized, include_hand=False, include_face=False)
 
+        interp_poses = interpolate_poses(start_poses, end_poses, interp_factor, omit_any_missing_points)
+
+        np_start_resized = start_remove_pad( np_start_resized)
+        np_end_resized = end_remove_pad( np_end_resized)
+        final_h = max(np_start_resized.shape[0], np_end_resized.shape[0])
+        final_w = max(np_start_resized.shape[1], np_end_resized.shape[1])
+
+        out_image = HWC3( open_pose.draw_poses( interp_poses, final_h, final_w, draw_body=True, draw_face=False, draw_hand=False) )
+
+        out_imgs = torch.stack([ torch.from_numpy(out_image.astype(np.float32) / 255.0 ) ], dim=0)
+
+        del model
+
+        return (out_imgs,)
+        
 NODE_CLASS_MAPPINGS = {
     "OpenposePreprocessorInterpolate": OpenPose_Preprocessor_Interpolate,
 }
